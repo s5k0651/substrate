@@ -18,7 +18,7 @@
 use crate::{
 	CodeHash, Event, Config, Pallet as Contracts,
 	TrieId, BalanceOf, ContractInfo, gas::GasMeter, rent::Rent, storage::{self, Storage},
-	Error, ContractInfoOf, Schedule, AliveContractInfo,
+	Error, ContractInfoOf, Schedule, AliveContractInfo, CurrentSchedule,
 };
 use sp_core::crypto::UncheckedFrom;
 use sp_std::{
@@ -133,15 +133,19 @@ impl<T: Config> Default for RentParams<T> {
 pub trait Ext: sealing::Sealed {
 	type T: Config;
 
-	/// Returns the storage entry of the executing account by the given `key`.
+	/// Call (possibly transferring some amount of funds) into the specified account.
 	///
-	/// Returns `None` if the `key` wasn't previously set by `set_storage` or
-	/// was deleted.
-	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>>;
-
-	/// Sets the storage entry by the given key to the specified value. If `value` is `None` then
-	/// the storage entry is deleted.
-	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult;
+	/// Returns the original code size of the called contract.
+	///
+	/// # Return Value
+	///
+	/// Result<(ExecReturnValue, CodeSize), (ExecError, CodeSize)>
+	fn call(
+		&mut self,
+		to: &AccountIdOf<Self::T>,
+		value: BalanceOf<Self::T>,
+		input_data: Vec<u8>,
+	) -> Result<(ExecReturnValue, u32), (ExecError, u32)>;
 
 	/// Instantiate a contract from the given code.
 	///
@@ -156,17 +160,9 @@ pub trait Ext: sealing::Sealed {
 		&mut self,
 		code: CodeHash<Self::T>,
 		value: BalanceOf<Self::T>,
-		gas_meter: &mut GasMeter<Self::T>,
 		input_data: Vec<u8>,
 		salt: &[u8],
 	) -> Result<(AccountIdOf<Self::T>, ExecReturnValue, u32), (ExecError, u32)>;
-
-	/// Transfer some amount of funds into the specified account.
-	fn transfer(
-		&mut self,
-		to: &AccountIdOf<Self::T>,
-		value: BalanceOf<Self::T>,
-	) -> DispatchResult;
 
 	/// Transfer all funds to `beneficiary` and delete the contract.
 	///
@@ -184,21 +180,6 @@ pub trait Ext: sealing::Sealed {
 		&mut self,
 		beneficiary: &AccountIdOf<Self::T>,
 	) -> Result<u32, (DispatchError, u32)>;
-
-	/// Call (possibly transferring some amount of funds) into the specified account.
-	///
-	/// Returns the original code size of the called contract.
-	///
-	/// # Return Value
-	///
-	/// Result<(ExecReturnValue, CodeSize), (ExecError, CodeSize)>
-	fn call(
-		&mut self,
-		to: &AccountIdOf<Self::T>,
-		value: BalanceOf<Self::T>,
-		gas_meter: &mut GasMeter<Self::T>,
-		input_data: Vec<u8>,
-	) -> Result<(ExecReturnValue, u32), (ExecError, u32)>;
 
 	/// Restores the given destination contract sacrificing the current one.
 	///
@@ -218,6 +199,23 @@ pub trait Ext: sealing::Sealed {
 		rent_allowance: BalanceOf<Self::T>,
 		delta: Vec<StorageKey>,
 	) -> Result<(u32, u32), (DispatchError, u32, u32)>;
+
+	/// Transfer some amount of funds into the specified account.
+	fn transfer(
+		&mut self,
+		to: &AccountIdOf<Self::T>,
+		value: BalanceOf<Self::T>,
+	) -> DispatchResult;
+
+	/// Returns the storage entry of the executing account by the given `key`.
+	///
+	/// Returns `None` if the `key` wasn't previously set by `set_storage` or
+	/// was deleted.
+	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>>;
+
+	/// Sets the storage entry by the given key to the specified value. If `value` is `None` then
+	/// the storage entry is deleted.
+	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult;
 
 	/// Returns a reference to the account id of the caller.
 	fn caller(&self) -> &AccountIdOf<Self::T>;
@@ -360,423 +358,345 @@ pub trait Executable<T: Config>: Sized {
 	}
 }
 
-pub struct ExecutionContext<'a, T: Config + 'a, E> {
-	caller: Option<&'a ExecutionContext<'a, T, E>>,
-	self_account: T::AccountId,
-	self_trie_id: Option<TrieId>,
-	depth: usize,
-	schedule: &'a Schedule<T>,
+pub struct Stack<'a, T: Config, E> {
+	origin: T::AccountId,
+	schedule: Schedule<T>,
+	gas_meter: &'a mut GasMeter<T>,
 	timestamp: MomentOf<T>,
 	block_number: T::BlockNumber,
+	first_frame: Frame<T>,
+	frames: Vec<Frame<T>>,
 	_phantom: PhantomData<E>,
 }
 
-impl<'a, T, E> ExecutionContext<'a, T, E>
+struct Frame<T: Config> {
+	account_id: T::AccountId,
+	trie_id: TrieId,
+	value_transferred: BalanceOf<T>,
+	rent_params: RentParams<T>,
+	input_data: Option<Vec<u8>>,
+}
+
+enum FrameArgs<'a, T: Config, E> {
+	Call(T::AccountId),
+	Instantiate(T::AccountId, E, &'a [u8]),
+}
+
+impl<'a, T, E> Stack<'a, T, E>
 where
 	T: Config,
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
 	E: Executable<T>,
 {
-	/// Create the top level execution context.
-	///
-	/// The specified `origin` address will be used as `sender` for. The `origin` must be a regular
-	/// account (not a contract).
-	pub fn top_level(origin: T::AccountId, schedule: &'a Schedule<T>) -> Self {
-		ExecutionContext {
-			caller: None,
-			self_trie_id: None,
-			self_account: origin,
-			depth: 0,
-			schedule,
-			timestamp: T::Time::now(),
-			block_number: <frame_system::Pallet<T>>::block_number(),
-			_phantom: Default::default(),
-		}
-	}
-
-	fn nested<'b, 'c: 'b>(&'c self, dest: T::AccountId, trie_id: TrieId)
-		-> ExecutionContext<'b, T, E>
-	{
-		ExecutionContext {
-			caller: Some(self),
-			self_trie_id: Some(trie_id),
-			self_account: dest,
-			depth: self.depth + 1,
-			schedule: self.schedule,
-			timestamp: self.timestamp.clone(),
-			block_number: self.block_number.clone(),
-			_phantom: Default::default(),
-		}
-	}
-
 	/// Make a call to the specified address, optionally transferring some funds.
 	///
 	/// # Return Value
 	///
 	/// Result<(ExecReturnValue, CodeSize), (ExecError, CodeSize)>
-	pub fn call(
-		&mut self,
+	pub fn with_call(
+		origin: T::AccountId,
 		dest: T::AccountId,
-		value: BalanceOf<T>,
 		gas_meter: &mut GasMeter<T>,
+		value: BalanceOf<T>,
 		input_data: Vec<u8>,
 	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
-		if self.depth == T::MaxDepth::get() as usize {
-			return Err((Error::<T>::MaxCallDepthReached.into(), 0));
-		}
-
-		let contract = <ContractInfoOf<T>>::get(&dest)
-			.and_then(|contract| contract.get_alive())
-			.ok_or((Error::<T>::NotCallable.into(), 0))?;
-
-		let executable = E::from_storage(contract.code_hash, &self.schedule, gas_meter)
-			.map_err(|e| (e.into(), 0))?;
-		let code_len = executable.code_len();
-
-		// This charges the rent and denies access to a contract that is in need of
-		// eviction by returning `None`. We cannot evict eagerly here because those
-		// changes would be rolled back in case this contract is called by another
-		// contract.
-		// See: https://github.com/paritytech/substrate/issues/6439#issuecomment-648754324
-		let contract = Rent::<T, E>::charge(&dest, contract, executable.occupied_storage())
-			.map_err(|e| (e.into(), code_len))?
-			.ok_or((Error::<T>::NotCallable.into(), code_len))?;
-
-		let transactor_kind = self.transactor_kind();
-		let caller = self.self_account.clone();
-
-		let result = self.with_nested_context(dest.clone(), contract.trie_id.clone(), |nested| {
-			if value > BalanceOf::<T>::zero() {
-				transfer::<T>(
-					TransferCause::Call,
-					transactor_kind,
-					&caller,
-					&dest,
-					value,
-				)?
-			}
-
-			let call_context = nested.new_call_context(
-				caller, &dest, value, &contract, &executable,
-			);
-
-			let output = executable.execute(
-				call_context,
-				&ExportedFunction::Call,
-				input_data,
-				gas_meter,
-			).map_err(|e| ExecError { error: e.error, origin: ErrorOrigin::Callee })?;
-			Ok(output)
-		}).map_err(|e| (e, code_len))?;
-		Ok((result, code_len))
+		let (mut stack, executable) = Self::new(
+			FrameArgs::Call(dest),
+			value,
+			input_data,
+			gas_meter
+		)?;
+		stack.call(executable)
 	}
 
-	pub fn instantiate(
-		&mut self,
-		endowment: BalanceOf<T>,
-		gas_meter: &mut GasMeter<T>,
+	pub fn with_instantiate(
+		origin: T::AccountId,
 		executable: E,
+		gas_meter: &mut GasMeter<T>,
+		value: BalanceOf<T>,
 		input_data: Vec<u8>,
 		salt: &[u8],
 	) -> Result<(T::AccountId, ExecReturnValue), ExecError> {
-		if self.depth == T::MaxDepth::get() as usize {
-			Err(Error::<T>::MaxCallDepthReached)?
+		let (mut stack, executable) = Self::new(
+			FrameArgs::Instantiate(origin, executable, salt),
+			value,
+			input_data,
+			gas_meter
+		).map_err(|(e, code_len)| e)?;
+		stack.instantiate(executable)
+	}
+
+	fn new(
+		origin: T::AccountId,
+		args: FrameArgs<T, E>,
+		gas_meter: &mut GasMeter<T>,
+		value: BalanceOf<T>,
+		input_data: Vec<u8>,
+	) -> Result<(Self, E), (ExecError, u32)> {
+		let schedule = <CurrentSchedule<T>>::get();
+		let (first_frame, executable) = Self::create_frame(args, value, input_data, gas_meter, &schedule)?;
+		let stack = Self {
+			origin,
+			schedule: <CurrentSchedule<T>>::get(),
+			gas_meter,
+			timestamp: T::Time::now(),
+			block_number: <frame_system::Pallet<T>>::block_number(),
+			first_frame,
+			frames: Vec::new(),
+			_phantom: Default::default(),
+		};
+		Ok((stack, executable))
+	}
+
+	fn call(&mut self, executable: E) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
+		// TODO: execute in transaction
+		self.initial_transfer()?;
+		let output = executable.execute(
+			&mut self,
+			&ExportedFunction::Call,
+			self.frame().input_data.take(),
+			self.gas_meter,
+		).map_err(|e| ExecError { error: e.error, origin: ErrorOrigin::Callee })?;
+
+		// TODO: drop the frame, merge contract info into parents on success.
+
+		Ok(output)
+	}
+
+	fn instantiate(&mut self, executable: E) -> Result<(T::AccountId, ExecReturnValue), ExecError> {
+		// TODO: merge with call and rename to `run_frame`.
+		self.initial_transfer()?;
+		// Cache the value before calling into the constructor because that
+		// consumes the value. If the constructor creates additional contracts using
+		// the same code hash we still charge the "1 block rent" as if they weren't
+		// spawned. This is OK as overcharging is always safe.
+		let occupied_storage = executable.occupied_storage();
+		let output = executable.execute(
+			&mut self,
+			&ExportedFunction::Constructor,
+			self.frame.input_data().take(),
+			self.gas_meter,
+		).map_err(|e| ExecError { error: e.error, origin: ErrorOrigin::Callee })?;
+
+		// We need to re-fetch the contract because changes are written to storage
+		// eagerly during execution.
+		let contract = <ContractInfoOf<T>>::get(self.frame().account_id)
+			.and_then(|contract| contract.get_alive())
+			.ok_or(Error::<T>::NotCallable)?;
+
+		// Collect the rent for the first block to prevent the creation of very large
+		// contracts that never intended to pay for even one block.
+		// This also makes sure that it is above the subsistence threshold
+		// in order to keep up the guarantuee that we always leave a tombstone behind
+		// with the exception of a contract that called `seal_terminate`.
+		Rent::<T, E>::charge(self.frame().account_id, contract, occupied_storage)?
+			.ok_or(Error::<T>::NewContractNotFunded)?;
+
+		// Deposit an instantiation event.
+		deposit_event::<T>(vec![], Event::Instantiated(
+			self.caller().clone(),
+			self.frame().account_id.clone(),
+		));
+
+		Ok((self.frame().account_id, output))
+	}
+
+	fn create_frame(
+		frame_args: FrameArgs<T, E>,
+		value_transferred: BalanceOf<T>,
+		input_data: Vec<u8>,
+		gas_meter: &mut GasMeter<T>,
+		schedule: &Schedule<T>
+	) -> Result<(Frame<T>, E), (ExecError, u32)> {
+		if T::MaxDepth::get() == 0 {
+			return Err((Error::<T>::MaxCallDepthReached.into(), 0));
 		}
 
-		let transactor_kind = self.transactor_kind();
-		let caller = self.self_account.clone();
-		let dest = Contracts::<T>::contract_address(&caller, executable.code_hash(), salt);
+		let (account_id, contract_info, executable) = match frame_args {
+			FrameArgs::Call(account_id) => {
+				let contract = <ContractInfoOf<T>>::get(&account_id)
+					.and_then(|contract| contract.get_alive())
+					.ok_or((Error::<T>::NotCallable.into(), 0))?;
 
-		let output = frame_support::storage::with_transaction(|| {
-			// Generate the trie id in a new transaction to only increment the counter on success.
-			let dest_trie_id = Storage::<T>::generate_trie_id(&dest);
+				let executable = E::from_storage(contract.code_hash, schedule, gas_meter)
+					.map_err(|e| (e.into(), 0))?;
 
-			let output = self.with_nested_context(dest.clone(), dest_trie_id, |nested| {
+				// This charges the rent and denies access to a contract that is in need of
+				// eviction by returning `None`. We cannot evict eagerly here because those
+				// changes would be rolled back in case this contract is called by another
+				// contract.
+				// See: https://github.com/paritytech/substrate/issues/6439#issuecomment-648754324
+				let contract = Rent::<T, E>::charge(&account_id, contract, executable.occupied_storage())
+					.map_err(|e| (e.into(), executable.code_len()))?
+					.ok_or((Error::<T>::NotCallable.into(), executable.code_len()))?;
+
+				(account_id, contract, executable)
+			}
+			FrameArgs::Instantiate(caller, executable, salt) => {
+				// TODO: this will leave changes in storage after error -> cache the contract_info instead
+				let account_id = <Contracts<T>>::contract_address(&caller, executable.code_hash(), &salt);
+				let trie_id = Storage::<T>::generate_trie_id(&account_id);
 				let contract = Storage::<T>::place_contract(
-					&dest,
-					nested
-						.self_trie_id
-						.clone()
-						.expect("the nested context always has to have self_trie_id"),
+					&account_id,
+					trie_id,
 					executable.code_hash().clone()
 				)?;
-
-				// Send funds unconditionally here. If the `endowment` is below existential_deposit
-				// then error will be returned here.
-				transfer::<T>(
-					TransferCause::Instantiate,
-					transactor_kind,
-					&caller,
-					&dest,
-					endowment,
-				)?;
-
-				// Cache the value before calling into the constructor because that
-				// consumes the value. If the constructor creates additional contracts using
-				// the same code hash we still charge the "1 block rent" as if they weren't
-				// spawned. This is OK as overcharging is always safe.
-				let occupied_storage = executable.occupied_storage();
-
-				let call_context = nested.new_call_context(
-					caller.clone(),
-					&dest,
-					endowment,
-					&contract,
-					&executable,
-				);
-
-				let output = executable.execute(
-					call_context,
-					&ExportedFunction::Constructor,
-					input_data,
-					gas_meter,
-				).map_err(|e| ExecError { error: e.error, origin: ErrorOrigin::Callee })?;
-
-				// We need to re-fetch the contract because changes are written to storage
-				// eagerly during execution.
-				let contract = <ContractInfoOf<T>>::get(&dest)
-					.and_then(|contract| contract.get_alive())
-					.ok_or(Error::<T>::NotCallable)?;
-
-				// Collect the rent for the first block to prevent the creation of very large
-				// contracts that never intended to pay for even one block.
-				// This also makes sure that it is above the subsistence threshold
-				// in order to keep up the guarantuee that we always leave a tombstone behind
-				// with the exception of a contract that called `seal_terminate`.
-				Rent::<T, E>::charge(&dest, contract, occupied_storage)?
-					.ok_or(Error::<T>::NewContractNotFunded)?;
-
-				// Deposit an instantiation event.
-				deposit_event::<T>(vec![], Event::Instantiated(caller.clone(), dest.clone()));
-
-				Ok(output)
-			});
-
-			use frame_support::storage::TransactionOutcome::*;
-			match output {
-				Ok(_) => Commit(output),
-				Err(_) => Rollback(output),
+				(account_id, contract, executable)
 			}
-		})?;
+		};
 
-		Ok((dest, output))
+		let frame = Frame {
+			rent_params: RentParams::new(&account_id, &contract_info, &executable)?,
+			value_transferred,
+			trie_id: contract_info.trie_id,
+			account_id,
+			input_data,
+		};
+
+		Ok((frame, executable))
 	}
 
-	fn new_call_context<'b>(
-		&'b mut self,
-		caller: T::AccountId,
-		dest: &T::AccountId,
+	fn push_frame(
+		&mut self,
+		frame_args: FrameArgs<T, E>,
+		value_transferred: BalanceOf<T>,
+		input_data: Vec<u8>,
+	) -> Result<E, (ExecError, u32)> {
+		if self.depth() == T::MaxDepth::get() {
+			return Err((Error::<T>::MaxCallDepthReached.into(), 0));
+		}
+		let (frame, executable) = Self::create_frame(
+			frame_args,
+			value_transferred,
+			input_data,
+			self.gas_meter,
+			&self.schedule,
+		)?;
+		self.frames.push(frame);
+		Ok(executable)
+	}
+
+	/// Transfer some funds from `transactor` to `dest`.
+	///
+	/// We only allow allow for draining all funds of the sender if `cause` is
+	/// is specified as `Terminate`. Otherwise, any transfer that would bring the sender below the
+	/// subsistence threshold (for contracts) or the existential deposit (for plain accounts)
+	/// results in an error.
+	fn transfer(
+		sender_is_contract: bool,
+		allow_death: bool,
+		from: T::AccountId,
+		to: T::AccountId,
 		value: BalanceOf<T>,
-		contract: &AliveContractInfo<T>,
-		executable: &E,
-	) -> CallContext<'b, 'a, T, E> {
-		let timestamp = self.timestamp.clone();
-		let block_number = self.block_number.clone();
-		CallContext {
-			ctx: self,
-			caller,
-			value_transferred: value,
-			timestamp,
-			block_number,
-			rent_params: RentParams::new(dest, contract, executable),
-			_phantom: Default::default(),
+	) -> DispatchResult {
+		if value == 0 {
+			return Ok(());
 		}
+
+		// Only seal_terminate is allowed to bring the sender below the subsistence
+		// threshold or even existential deposit.
+		let existence_requirement = match (allow_death, sender_is_contract) {
+			(true, _) => ExistenceRequirement::AllowDeath,
+			(false, true) => {
+				ensure!(
+					T::Currency::total_balance(from).saturating_sub(value) >=
+						Contracts::<T>::subsistence_threshold(),
+					Error::<T>::BelowSubsistenceThreshold,
+				);
+				ExistenceRequirement::KeepAlive
+			},
+			(false, false) => ExistenceRequirement::KeepAlive,
+		};
+
+		T::Currency::transfer(from, to, value, existence_requirement)
+			.map_err(|_| Error::<T>::TransferFailed)?;
+
+		Ok(())
 	}
 
-	/// Execute the given closure within a nested execution context.
-	fn with_nested_context<F>(&mut self, dest: T::AccountId, trie_id: TrieId, func: F)
-		-> ExecResult
-		where F: FnOnce(&mut ExecutionContext<T, E>) -> ExecResult
-	{
-		use frame_support::storage::TransactionOutcome::*;
-		let mut nested = self.nested(dest, trie_id);
-		frame_support::storage::with_transaction(|| {
-			let output = func(&mut nested);
-			match output {
-				Ok(ref rv) if !rv.flags.contains(ReturnFlags::REVERT) => Commit(output),
-				_ => Rollback(output),
-			}
-		})
+	fn initial_transfer(&self) -> DispatchResult {
+		Self::transfer(
+			self.caller_is_contract(),
+			false,
+			self.caller(),
+			self.frame().account_id,
+			self.frame().value_transferred,
+		)
 	}
 
-	/// Returns whether a contract, identified by address, is currently live in the execution
-	/// stack, meaning it is in the middle of an execution.
-	fn is_live(&self, account: &T::AccountId) -> bool {
-		&self.self_account == account ||
-			self.caller.map_or(false, |caller| caller.is_live(account))
+	fn depth(&self) -> u32 {
+		(self.frames.len() + 1) as u32
 	}
 
-	fn transactor_kind(&self) -> TransactorKind {
-		if self.depth == 0 {
-			debug_assert!(self.self_trie_id.is_none());
-			debug_assert!(self.caller.is_none());
-			debug_assert!(ContractInfoOf::<T>::get(&self.self_account).is_none());
-			TransactorKind::PlainAccount
-		} else {
-			TransactorKind::Contract
-		}
+	fn caller_is_contract(&self) -> bool {
+		self.depth() > 1
+	}
+
+	fn frame(&self) -> &Frame<T> {
+		self.frames.last().unwrap_or(&self.first_frame)
+	}
+
+	fn frames(&self) -> impl Iterator<Item=&Frame<T>> {
+		sp_std::iter::once(&self.first_frame)
+			.chain(&self.frames)
+			.rev()
+	}
+
+	/// Returns whether the current contract is on the stack multiple times.
+	fn is_recursive(&self) -> bool {
+		self.frames().skip(1).any(|f| f.account_id == &self.frame().account_id)
 	}
 }
 
-/// Describes whether we deal with a contract or a plain account.
-enum TransactorKind {
-	/// Transaction was initiated from a plain account. That can be either be through a
-	/// signed transaction or through RPC.
-	PlainAccount,
-	/// The call was initiated by a contract account.
-	Contract,
-}
-
-/// Describes possible transfer causes.
-enum TransferCause {
-	Call,
-	Instantiate,
-	Terminate,
-}
-
-/// Transfer some funds from `transactor` to `dest`.
-///
-/// We only allow allow for draining all funds of the sender if `cause` is
-/// is specified as `Terminate`. Otherwise, any transfer that would bring the sender below the
-/// subsistence threshold (for contracts) or the existential deposit (for plain accounts)
-/// results in an error.
-fn transfer<T: Config>(
-	cause: TransferCause,
-	origin: TransactorKind,
-	transactor: &T::AccountId,
-	dest: &T::AccountId,
-	value: BalanceOf<T>,
-) -> DispatchResult
+impl<'a, T, E> Ext for Stack<'a, T, E>
 where
-	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
-{
-	use self::TransferCause::*;
-	use self::TransactorKind::*;
-
-	// Only seal_terminate is allowed to bring the sender below the subsistence
-	// threshold or even existential deposit.
-	let existence_requirement = match (cause, origin) {
-		(Terminate, _) => ExistenceRequirement::AllowDeath,
-		(_, Contract) => {
-			ensure!(
-				T::Currency::total_balance(transactor).saturating_sub(value) >=
-					Contracts::<T>::subsistence_threshold(),
-				Error::<T>::BelowSubsistenceThreshold,
-			);
-			ExistenceRequirement::KeepAlive
-		},
-		(_, PlainAccount) => ExistenceRequirement::KeepAlive,
-	};
-
-	T::Currency::transfer(transactor, dest, value, existence_requirement)
-		.map_err(|_| Error::<T>::TransferFailed)?;
-
-	Ok(())
-}
-
-/// A context that is active within a call.
-///
-/// This context has some invariants that must be held at all times. Specifically:
-///`ctx` always points to a context of an alive contract. That implies that it has an existent
-/// `self_trie_id`.
-///
-/// Be advised that there are brief time spans where these invariants could be invalidated.
-/// For example, when a contract requests self-termination the contract is removed eagerly. That
-/// implies that the control won't be returned to the contract anymore, but there is still some code
-/// on the path of the return from that call context. Therefore, care must be taken in these
-/// situations.
-struct CallContext<'a, 'b: 'a, T: Config + 'b, E> {
-	ctx: &'a mut ExecutionContext<'b, T, E>,
-	caller: T::AccountId,
-	value_transferred: BalanceOf<T>,
-	timestamp: MomentOf<T>,
-	block_number: T::BlockNumber,
-	rent_params: RentParams<T>,
-	_phantom: PhantomData<E>,
-}
-
-impl<'a, 'b: 'a, T, E> Ext for CallContext<'a, 'b, T, E>
-where
-	T: Config + 'b,
+	T: Config,
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
 	E: Executable<T>,
 {
 	type T = T;
 
-	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>> {
-		let trie_id = self.ctx.self_trie_id.as_ref().expect(
-			"`ctx.self_trie_id` points to an alive contract within the `CallContext`;\
-				it cannot be `None`;\
-				expect can't fail;\
-				qed",
-		);
-		Storage::<T>::read(trie_id, key)
-	}
-
-	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult {
-		let trie_id = self.ctx.self_trie_id.as_ref().expect(
-			"`ctx.self_trie_id` points to an alive contract within the `CallContext`;\
-				it cannot be `None`;\
-				expect can't fail;\
-				qed",
-		);
-		// write panics if the passed account is not alive.
-		// the contract must be in the alive state within the `CallContext`;\
-		// the contract cannot be absent in storage;
-		// write cannot return `None`;
-		// qed
-		Storage::<T>::write(&self.ctx.self_account, trie_id, &key, value)
+	fn call(
+		&mut self,
+		to: &T::AccountId,
+		value: BalanceOf<T>,
+		input_data: Vec<u8>,
+	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
+		let executable = self.push_frame(FrameArgs::Call(to), value, input_data)?;
+		self.call(executable)
 	}
 
 	fn instantiate(
 		&mut self,
 		code_hash: CodeHash<T>,
 		endowment: BalanceOf<T>,
-		gas_meter: &mut GasMeter<T>,
 		input_data: Vec<u8>,
 		salt: &[u8],
 	) -> Result<(AccountIdOf<T>, ExecReturnValue, u32), (ExecError, u32)> {
-		let executable = E::from_storage(code_hash, &self.ctx.schedule, gas_meter)
+		let executable = E::from_storage(code_hash, &self.ctx.schedule, self.gas_meter)
 			.map_err(|e| (e.into(), 0))?;
+		let executable = self.push_frame(
+			FrameArgs::Instantiate(self.frame().account_id, executable, salt),
+			endowment,
+			input_data,
+		)?;
 		let code_len = executable.code_len();
-		self.ctx.instantiate(endowment, gas_meter, executable, input_data, salt)
+		self.instantiate(executable)
 			.map(|r| (r.0, r.1, code_len))
 			.map_err(|e| (e, code_len))
-	}
-
-	fn transfer(
-		&mut self,
-		to: &T::AccountId,
-		value: BalanceOf<T>,
-	) -> DispatchResult {
-		transfer::<T>(
-			TransferCause::Call,
-			TransactorKind::Contract,
-			&self.ctx.self_account.clone(),
-			to,
-			value,
-		)
 	}
 
 	fn terminate(
 		&mut self,
 		beneficiary: &AccountIdOf<Self::T>,
 	) -> Result<u32, (DispatchError, u32)> {
-		let self_id = self.ctx.self_account.clone();
+		let self_id = self.frame().account_id();
 		let value = T::Currency::free_balance(&self_id);
-		if let Some(caller_ctx) = self.ctx.caller {
-			if caller_ctx.is_live(&self_id) {
-				return Err((Error::<T>::ReentranceDenied.into(), 0));
-			}
+		if self.is_recursive() {
+			return Err((Error::<T>::ReentranceDenied.into(), 0));
 		}
-		transfer::<T>(
-			TransferCause::Terminate,
-			TransactorKind::Contract,
-			&self_id,
-			beneficiary,
-			value,
-		).map_err(|e| (e, 0))?;
-		if let Some(ContractInfo::Alive(info)) = ContractInfoOf::<T>::take(&self_id) {
+		self.transfer(true, true, self_id, beneficiary, value).map_err(|e| (e, 0))?;
+		if let Some(ContractInfo::Alive(info)) = ContractInfoOf::<T>::take(self_id) {
 			Storage::<T>::queue_trie_for_deletion(&info).map_err(|e| (e, 0))?;
 			let code_len = E::remove_user(info.code_hash);
 			Contracts::<T>::deposit_event(Event::Terminated(self_id, beneficiary.clone()));
@@ -790,16 +710,6 @@ where
 		}
 	}
 
-	fn call(
-		&mut self,
-		to: &T::AccountId,
-		value: BalanceOf<T>,
-		gas_meter: &mut GasMeter<T>,
-		input_data: Vec<u8>,
-	) -> Result<(ExecReturnValue, u32), (ExecError, u32)> {
-		self.ctx.call(to.clone(), value, gas_meter, input_data)
-	}
-
 	fn restore_to(
 		&mut self,
 		dest: AccountIdOf<Self::T>,
@@ -807,14 +717,11 @@ where
 		rent_allowance: BalanceOf<Self::T>,
 		delta: Vec<StorageKey>,
 	) -> Result<(u32, u32), (DispatchError, u32, u32)> {
-		if let Some(caller_ctx) = self.ctx.caller {
-			if caller_ctx.is_live(&self.ctx.self_account) {
-				return Err((Error::<T>::ReentranceDenied.into(), 0, 0));
-			}
+		if self.is_recursive() {
+			return Err((Error::<T>::ReentranceDenied.into(), 0, 0));
 		}
-
 		let result = Rent::<T, E>::restore_to(
-			self.ctx.self_account.clone(),
+			self.frame().account_id.clone(),
 			dest.clone(),
 			code_hash.clone(),
 			rent_allowance,
@@ -824,7 +731,7 @@ where
 			deposit_event::<Self::T>(
 				vec![],
 				Event::Restored(
-					self.ctx.self_account.clone(),
+					self.frame().account_id.clone(),
 					dest,
 					code_hash,
 					rent_allowance,
@@ -834,20 +741,41 @@ where
 		result
 	}
 
+	fn transfer(
+		&mut self,
+		to: &T::AccountId,
+		value: BalanceOf<T>,
+	) -> DispatchResult {
+		Self::transfer(true, false, self.frame().account_id, to, value)
+	}
+
+	fn get_storage(&self, key: &StorageKey) -> Option<Vec<u8>> {
+		Storage::<T>::read(&self.frame().trie_id, key)
+	}
+
+	fn set_storage(&mut self, key: StorageKey, value: Option<Vec<u8>>) -> DispatchResult {
+		// write panics if the passed account is not alive.
+		// the contract must be in the alive state within the `CallContext`;\
+		// the contract cannot be absent in storage;
+		// write cannot return `None`;
+		// qed
+		Storage::<T>::write(&self.frame().account_id, &self.frame().trie_id, &key, value)
+	}
+
 	fn address(&self) -> &T::AccountId {
-		&self.ctx.self_account
+		&self.frame().account_id
 	}
 
 	fn caller(&self) -> &T::AccountId {
-		&self.caller
+		self.frames().nth(1).map(|f| f.account_id).unwrap_or(&self.origin)
 	}
 
 	fn balance(&self) -> BalanceOf<T> {
-		T::Currency::free_balance(&self.ctx.self_account)
+		T::Currency::free_balance(&self.account_id)
 	}
 
 	fn value_transferred(&self) -> BalanceOf<T> {
-		self.value_transferred
+		self.frame().value_transferred
 	}
 
 	fn random(&self, subject: &[u8]) -> (SeedOf<T>, BlockNumberOf<T>) {
@@ -869,13 +797,13 @@ where
 	fn deposit_event(&mut self, topics: Vec<T::Hash>, data: Vec<u8>) {
 		deposit_event::<Self::T>(
 			topics,
-			Event::ContractEmitted(self.ctx.self_account.clone(), data)
+			Event::ContractEmitted(self.frame().account_id.clone(), data)
 		);
 	}
 
 	fn set_rent_allowance(&mut self, rent_allowance: BalanceOf<T>) {
 		if let Err(storage::ContractAbsentError) =
-			Storage::<T>::set_rent_allowance(&self.ctx.self_account, rent_allowance)
+			Storage::<T>::set_rent_allowance(&self.frame().account_id, rent_allowance)
 		{
 			panic!(
 				"`self_account` points to an alive contract within the `CallContext`;
@@ -885,7 +813,7 @@ where
 	}
 
 	fn rent_allowance(&self) -> BalanceOf<T> {
-		Storage::<T>::rent_allowance(&self.ctx.self_account)
+		Storage::<T>::rent_allowance(&self.frame().account_id)
 			.unwrap_or_else(|_| <BalanceOf<T>>::max_value()) // Must never be triggered actually
 	}
 
@@ -900,11 +828,11 @@ where
 	}
 
 	fn schedule(&self) -> &Schedule<Self::T> {
-		&self.ctx.schedule
+		&self.schedule
 	}
 
 	fn rent_params(&self) -> &RentParams<Self::T> {
-		&self.rent_params
+		&self.frame().rent_params
 	}
 }
 
@@ -923,7 +851,7 @@ mod sealing {
 
 	pub trait Sealed {}
 
-	impl<'a, 'b: 'a, T: Config, E> Sealed for CallContext<'a, 'b, T, E> {}
+	impl<'a, T: Config, E> Sealed for Stack<'a, T, E> {}
 
 	#[cfg(test)]
 	impl Sealed for crate::wasm::MockExt {}
